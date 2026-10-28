@@ -562,7 +562,14 @@ func (s *service) storeAttachments(ctx context.Context, wid uuid.UUID, pm *parse
 		a := preparedAttachment{id: ids.New(), size: int64(len(p.Content)), cid: normalizeCID(p.ContentID)}
 		a.filename = cleanFilename(p.FileName, ct)
 		// The stored type comes from the bytes, as for an upload: active types are kept as plain text.
-		a.contentType = hd.DetectType(p.Content[:min(len(p.Content), 512)], a.filename)
+		head := p.Content[:min(len(p.Content), attachmentHeadBytes)]
+		a.contentType = hd.DetectType(head, a.filename)
+		// A ZIP that only names itself an office document is not one: keep the
+		// attachment (mail is not type-gated) but store its honest type so nobody
+		// opening or importing it treats it as a document package.
+		if err := hd.VerifyOfficePackage(head, bytes.NewReader(p.Content[len(head):]), a.filename); errors.Is(err, hd.ErrOfficePackageInvalid) {
+			a.contentType = "application/zip"
+		}
 		a.key = "workspaces/" + wid.String() + "/attachments/" + a.id.String()
 		if err := s.d.Storage.Put(ctx, a.key, bytes.NewReader(p.Content), a.size, a.contentType); err != nil {
 			s.deleteAttachmentObjects(out)

@@ -29,6 +29,9 @@ var fileTypes = []FileType{
 	{ID: "csv", Group: "document", Extensions: []string{".csv"}, match: plainText},
 	{ID: "rtf", Group: "document", Extensions: []string{".rtf"}, match: prefix(`{\rtf`)},
 	{ID: "doc", Group: "document", Extensions: []string{".doc"}, match: prefix(ole)},
+	// The ZIP-headed office formats pass the first-bytes gate on the prefix;
+	// SaveUpload then checks the package structure the extension promises
+	// (VerifyOfficePackage), so a plain archive cannot borrow the name.
 	{ID: "docx", Group: "document", Extensions: []string{".docx"}, match: prefix(zip)},
 	{ID: "odt", Group: "document", Extensions: []string{".odt"}, match: prefix(zip)},
 	{ID: "xls", Group: "spreadsheet", Extensions: []string{".xls"}, match: prefix(ole)},

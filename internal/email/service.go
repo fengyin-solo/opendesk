@@ -11,10 +11,11 @@ import (
 
 // Limits on what the pipeline accepts.
 const (
-	maxRawBytes        = 30 << 20 // one raw RFC 822 message
-	maxAttachmentBytes = 25 << 20 // one attachment
-	maxAttachments     = 50       // per inbound message
-	maxOutboundBytes   = 25 << 20 // total attachments on one outbound message
+	maxRawBytes         = 30 << 20 // one raw RFC 822 message
+	maxAttachmentBytes  = 25 << 20 // one attachment
+	maxAttachments      = 50       // per inbound message
+	maxOutboundBytes    = 25 << 20 // total attachments on one outbound message
+	attachmentHeadBytes = 512      // sniffed to label a stored attachment
 )
 
 // service is the email area. It is cheap to construct and holds no per-request state.

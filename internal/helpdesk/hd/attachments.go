@@ -202,10 +202,49 @@ func SaveUpload(ctx context.Context, st storage.Storage, q db.Querier, up Upload
 	ct := DetectType(head, filename)
 	id := ids.New()
 	key := "workspaces/" + up.WorkspaceID.String() + "/attachments/" + id.String()
-	body := io.LimitReader(io.MultiReader(bytes.NewReader(head), up.Body), MaxAttachmentBytes+1)
+	var source io.Reader = io.MultiReader(bytes.NewReader(head), up.Body)
+	// An office-named ZIP must be the complete package its extension claims.
+	// Verify the structure on the bytes as they stream to storage once: nothing
+	// is spooled whole, and a failure deletes what was written.
+	var (
+		pkgPW     *io.PipeWriter
+		pkgDone   chan error
+		pkgFamily officeFamily
+		pkgCheck  bool
+	)
+	if f, ok := officePackageFamily(filename, head); ok {
+		pr, pw := io.Pipe()
+		pkgPW, pkgDone, pkgFamily, pkgCheck = pw, make(chan error, 1), f, true
+		go func() {
+			err := verifyOfficePackage(pkgFamily, pr)
+			_ = pr.Close()
+			pkgDone <- err
+		}()
+		source = io.TeeReader(source, pw)
+	}
+	body := io.LimitReader(source, MaxAttachmentBytes+1)
 	counter := &countingReader{r: body}
-	if err := st.Put(ctx, key, counter, up.Size, ct); err != nil {
-		return domain.Attachment{}, fmt.Errorf("store upload: %w", err)
+	if putErr := st.Put(ctx, key, counter, up.Size, ct); putErr != nil {
+		if pkgCheck {
+			_ = pkgPW.CloseWithError(putErr)
+			if pkgErr := <-pkgDone; pkgErr != nil {
+				_ = st.Delete(context.WithoutCancel(ctx), key)
+				return domain.Attachment{}, ErrOfficePackageInvalid
+			}
+		}
+		return domain.Attachment{}, fmt.Errorf("store upload: %w", putErr)
+	}
+	if pkgCheck {
+		_ = pkgPW.Close()
+		pkgErr := <-pkgDone
+		if counter.n > MaxAttachmentBytes {
+			_ = st.Delete(context.WithoutCancel(ctx), key)
+			return domain.Attachment{}, httpx.E(413, "too_large", "Files can be at most 25 MB.")
+		}
+		if pkgErr != nil {
+			_ = st.Delete(context.WithoutCancel(ctx), key)
+			return domain.Attachment{}, ErrOfficePackageInvalid
+		}
 	}
 	if counter.n > MaxAttachmentBytes {
 		_ = st.Delete(context.WithoutCancel(ctx), key)
@@ -224,10 +263,18 @@ func SaveUpload(ctx context.Context, st storage.Storage, q db.Querier, up Upload
 const sniffBytes = 4096
 
 // Accept decides whether an upload is taken, by its first bytes, name and size.
+// It is a head-level gate: SaveUpload additionally verifies ZIP office packages
+// against their full structure after the head gate passes.
 type Accept func(head []byte, filename string, size int64) error
 
 // ErrFileTypeNotAllowed refuses a file of a type the place it is sent to does not take.
 var ErrFileTypeNotAllowed = httpx.E(422, "file_type_not_allowed", "This type of file can't be sent here.")
+
+// ErrOfficePackageInvalid refuses a ZIP that carries an office document name
+// but is not that family's complete package: a plain archive, another family's
+// package or a broken archive cannot borrow the extension.
+var ErrOfficePackageInvalid = httpx.E(422, "file_type_refused",
+	"The file isn't a valid Word, Excel, PowerPoint or OpenDocument document.")
 
 // AcceptTypes takes files of types (FileTypes ids); empty types take any.
 func AcceptTypes(types []string) Accept {
@@ -237,6 +284,13 @@ func AcceptTypes(types []string) Accept {
 		}
 		return nil
 	}
+}
+
+// storedFile is the name, object key and size of a stored attachment checked
+// before it is attached.
+type storedFile struct {
+	name, key string
+	size      int64
 }
 
 // CheckAttachmentFiles holds uploads about to be attached to accept, by their names,
@@ -249,30 +303,42 @@ func CheckAttachmentFiles(ctx context.Context, st storage.Storage, q db.Querier,
 	if err != nil {
 		return err
 	}
-	type file struct {
-		name, key string
-		size      int64
-	}
-	files, err := pgx.CollectRows(rows, func(r pgx.CollectableRow) (file, error) {
-		var f file
+	files, err := pgx.CollectRows(rows, func(r pgx.CollectableRow) (storedFile, error) {
+		var f storedFile
 		return f, r.Scan(&f.name, &f.key, &f.size)
 	})
 	if err != nil {
 		return err
 	}
 	for _, f := range files {
-		body, err := st.Get(ctx, f.key)
-		if err != nil {
-			return fmt.Errorf("read attachment: %w", err)
-		}
-		head := make([]byte, sniffBytes)
-		n, err := io.ReadFull(body, head)
-		_ = body.Close()
-		if err != nil && err != io.ErrUnexpectedEOF && err != io.EOF {
-			return fmt.Errorf("read attachment: %w", err)
-		}
-		if err := accept(head[:n], f.name, f.size); err != nil {
+		if err := checkStoredFile(ctx, st, f, accept); err != nil {
 			return err
+		}
+	}
+	return nil
+}
+
+// checkStoredFile holds one stored attachment to accept: its first bytes and
+// name as the upload was, and, for an office-named ZIP, the package structure
+// streamed from the stored object.
+func checkStoredFile(ctx context.Context, st storage.Storage, f storedFile, accept Accept) error {
+	body, err := st.Get(ctx, f.key)
+	if err != nil {
+		return fmt.Errorf("read attachment: %w", err)
+	}
+	defer body.Close()
+	head := make([]byte, sniffBytes)
+	n, err := io.ReadFull(body, head)
+	if err != nil && err != io.ErrUnexpectedEOF && err != io.EOF {
+		return fmt.Errorf("read attachment: %w", err)
+	}
+	head = head[:n]
+	if err := accept(head, f.name, f.size); err != nil {
+		return err
+	}
+	if fam, ok := officePackageFamily(f.name, head); ok {
+		if err := verifyOfficePackage(fam, io.MultiReader(bytes.NewReader(head), body)); err != nil {
+			return ErrOfficePackageInvalid
 		}
 	}
 	return nil

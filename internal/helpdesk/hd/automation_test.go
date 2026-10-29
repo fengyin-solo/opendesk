@@ -8,6 +8,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/useopendesk/opendesk/internal/domain"
 	"github.com/useopendesk/opendesk/internal/helpdesk/hd"
 )
 
@@ -65,6 +66,31 @@ func TestValidatePhraseConditions(t *testing.T) {
 	for i, c := range bad {
 		if _, err := validate(c); err == nil {
 			t.Errorf("bad[%d] %s %s accepted", i, c.Field, c.Op)
+		}
+	}
+}
+
+func TestNormalizeFieldFiltersNumber(t *testing.T) {
+	defs := domain.FieldDefs{"amount": {Key: "amount", Name: "Amount", Type: domain.FieldNumber}}
+	norm := func(op, value string) error {
+		_, err := hd.NormalizeFieldFilters(defs, []hd.FieldFilter{{Key: "amount", Op: op, Value: value}})
+		return err
+	}
+	// Non-finite spellings never become filters.
+	for _, v := range []string{"NaN", "nan", "Inf", "+Inf", "-Inf", "Infinity", "+Infinity", "-Infinity"} {
+		if err := norm("gt", v); err == nil {
+			t.Errorf("%q accepted as a number filter", v)
+		}
+	}
+	// Finite values in every comparison spelling, and the null-value ops, are kept.
+	for _, c := range []struct {
+		op, value string
+	}{
+		{"eq", "0"}, {"ne", "-1.5"}, {"gt", "1e3"}, {"gte", "100.25"}, {"lt", "1e308"}, {"lte", "-0.0001"},
+		{"set", ""}, {"not_set", ""},
+	} {
+		if err := norm(c.op, c.value); err != nil {
+			t.Errorf("%s %q refused: %v", c.op, c.value, err)
 		}
 	}
 }

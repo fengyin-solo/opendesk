@@ -1,14 +1,18 @@
 package resources_test
 
 import (
+	"context"
+	"errors"
 	"os"
 	"regexp"
 	"slices"
 	"strings"
 	"testing"
 
+	"github.com/useopendesk/opendesk/internal/helpdesk/hd"
 	"github.com/useopendesk/opendesk/internal/helpdesk/hdtest"
 	"github.com/useopendesk/opendesk/internal/helpdesk/resources"
+	"github.com/useopendesk/opendesk/internal/httpx"
 	"github.com/useopendesk/opendesk/internal/ids"
 )
 
@@ -816,4 +820,69 @@ func TestAutomations(t *testing.T) {
 	e.Do("PATCH", "/v1/automations/"+merge.ID, ad, map[string]any{"actions": []map[string]any{{"type": "merge_into_open_ticket", "value": "31"}}}).Want(t, 422)
 	e.Do("POST", "/v1/automations", ad, map[string]any{"name": "x", "trigger": "ticket_updated",
 		"actions": []map[string]any{{"type": "merge_into_open_ticket", "value": "7"}}}).Want(t, 422)
+
+	// Numeric custom field conditions: the constructor refuses non-finite
+	// operands for ticket and contact fields, names the field, and nothing is stored.
+	e.Exec(`INSERT INTO custom_fields (workspace_id, entity, key, name, type) VALUES
+		($1, 'ticket', 'amount', 'Amount', 'number'), ($1, 'contact', 'seats', 'Seats', 'number')`, ws.ID)
+	nonFinite := []string{"NaN", "nan", "Inf", "+Inf", "-Inf", "Infinity", "+Infinity", "-Infinity"}
+	for _, v := range nonFinite {
+		for _, c := range []hd.Condition{
+			{Field: "field.amount", Op: "gt", Value: v},
+			{Field: "contact.field.seats", Op: "lt", Value: v},
+		} {
+			_, err := hd.ValidateConditions(context.Background(), e.D.DB.Pool, ws.ID, []hd.Condition{c})
+			var he *httpx.Error
+			if !errors.As(err, &he) || he.Code != "validation_failed" || !strings.Contains(he.Detail, "field.") {
+				t.Fatalf("constructor %s %q: %v", c.Field, v, err)
+			}
+		}
+		res := e.Do("POST", "/v1/automations", ad, map[string]any{"name": "bad " + v, "trigger": "ticket_created",
+			"conditions": []map[string]any{{"field": "field.amount", "op": "gt", "value": v}},
+			"actions":    []map[string]any{{"type": "add_tag", "value": "a"}}})
+		if res.Status != 422 || !strings.Contains(string(res.Body), "validation_failed") || !strings.Contains(string(res.Body), "field.amount") {
+			t.Fatalf("POST %q: %d %s", v, res.Status, res.Body)
+		}
+	}
+	var badCount int
+	e.Scalar(`SELECT count(*) FROM automations WHERE workspace_id = $1 AND name LIKE 'bad %'`, &badCount, ws.ID)
+	if badCount != 0 {
+		t.Fatalf("%d invalid automations stored", badCount)
+	}
+
+	// Finite operands, including negatives, decimals, exponent notation and very
+	// large finite numbers, plus set/not_set, are kept for ticket and contact fields.
+	var nums automation
+	e.Do("POST", "/v1/automations", ad, map[string]any{"name": "Amounts", "trigger": "ticket_created",
+		"conditions": []map[string]any{
+			{"field": "field.amount", "op": "gte", "value": "-1.5"},
+			{"field": "field.amount", "op": "eq", "value": "1e3"},
+			{"field": "contact.field.seats", "op": "lt", "value": "1e308"},
+			{"field": "field.amount", "op": "not_set", "value": ""},
+		},
+		"actions": []map[string]any{{"type": "add_tag", "value": "a"}}}).Want(t, 201).JSON(t, &nums)
+	want := []map[string]string{
+		{"field": "field.amount", "op": "gte", "value": "-1.5"},
+		{"field": "field.amount", "op": "eq", "value": "1e3"},
+		{"field": "contact.field.seats", "op": "lt", "value": "1e308"},
+		{"field": "field.amount", "op": "not_set", "value": ""},
+	}
+	if len(nums.Conditions) != len(want) {
+		t.Fatalf("stored conditions %+v", nums.Conditions)
+	}
+	for i, c := range want {
+		for k, v := range c {
+			if got := nums.Conditions[i][k]; got != v {
+				t.Fatalf("condition %d %s = %v, want %q", i, k, got, v)
+			}
+		}
+	}
+	// A bad operand on PATCH is refused and leaves the stored automation unchanged.
+	e.Do("PATCH", "/v1/automations/"+nums.ID, ad, map[string]any{"conditions": []map[string]any{
+		{"field": "field.amount", "op": "gt", "value": "Infinity"}}}).Want(t, 422)
+	var kept automation
+	e.Do("GET", "/v1/automations/"+nums.ID, ad, nil).Want(t, 200).JSON(t, &kept)
+	if len(kept.Conditions) != 4 || kept.Conditions[1]["value"] != "1e3" {
+		t.Fatalf("automation changed after failed patch: %+v", kept.Conditions)
+	}
 }

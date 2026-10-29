@@ -3,6 +3,7 @@ package contacts_test
 import (
 	"net/url"
 	"slices"
+	"strings"
 	"testing"
 
 	"github.com/useopendesk/opendesk/internal/helpdesk/contacts"
@@ -68,6 +69,33 @@ func TestContactAndCompanyLabelsAndFields(t *testing.T) {
 		t.Fatalf("search %+v", p)
 	}
 	e.Do("GET", "/v1/contacts?field.nope=1", a, nil).Want(t, 422)
+
+	// Numeric field filters: non-finite operands are 422 validation_failed naming
+	// the field; finite exponent, negative and decimal operands match stored values.
+	e.Exec(`INSERT INTO custom_fields (workspace_id, entity, key, name, type) VALUES ($1, 'contact', 'score', 'Score', 'number')`, ws.ID)
+	e.Do("PATCH", "/v1/contacts/"+c.ID, a, map[string]any{"fields": map[string]any{"score": 1000}}).Want(t, 200)
+	for _, v := range []string{"NaN", "Inf", "-Inf", "Infinity"} {
+		res := e.Do("GET", "/v1/contacts?"+url.QueryEscape("field.score[gt]")+"="+v, a, nil)
+		if res.Status != 422 || !strings.Contains(string(res.Body), "validation_failed") || !strings.Contains(string(res.Body), "field.score") {
+			t.Fatalf("filter %q: %d %s", v, res.Status, res.Body)
+		}
+	}
+	e.Do("GET", "/v1/contacts?"+url.QueryEscape("field.score[eq]")+"=1e3", a, nil).Want(t, 200).JSON(t, &p)
+	if len(p.Data) != 1 || p.Data[0].ID != c.ID {
+		t.Fatalf("exponent filter %+v", p.Data)
+	}
+	e.Do("GET", "/v1/contacts?"+url.QueryEscape("field.score[gte]")+"=-1.5", a, nil).Want(t, 200).JSON(t, &p)
+	if len(p.Data) != 1 || p.Data[0].ID != c.ID {
+		t.Fatalf("negative/decimal filter %+v", p.Data)
+	}
+	e.Do("GET", "/v1/contacts?"+url.QueryEscape("field.score[set]")+"=", a, nil).Want(t, 200).JSON(t, &p)
+	if len(p.Data) != 1 || p.Data[0].ID != c.ID {
+		t.Fatalf("set filter %+v", p.Data)
+	}
+	e.Do("GET", "/v1/contacts?"+url.QueryEscape("field.score[not_set]")+"=", a, nil).Want(t, 200).JSON(t, &p)
+	if len(p.Data) != 1 || p.Data[0].ID == c.ID {
+		t.Fatalf("not_set filter %+v", p.Data)
+	}
 
 	var co labelled
 	e.Do("POST", "/v1/companies", a, map[string]any{"name": "Acme", "tags": []string{"Gold"}, "fields": map[string]any{"seats": 40}}).

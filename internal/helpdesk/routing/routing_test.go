@@ -2,6 +2,7 @@ package routing
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 
@@ -14,6 +15,7 @@ import (
 	"github.com/useopendesk/opendesk/internal/deps"
 	"github.com/useopendesk/opendesk/internal/domain"
 	"github.com/useopendesk/opendesk/internal/helpdesk/hdtest"
+	"github.com/useopendesk/opendesk/internal/httpx"
 	"github.com/useopendesk/opendesk/internal/ids"
 )
 
@@ -279,5 +281,71 @@ func TestResolve(t *testing.T) {
 	w.e.Scalar(`SELECT run_count FROM routing_rules WHERE workspace_id = $1 AND name = 'VIP'`, &runs, w.ws.ID)
 	if runs != 0 {
 		t.Fatalf("test counted a run: %d", runs)
+	}
+}
+
+func TestContactNumberFieldConditions(t *testing.T) {
+	w := newWorld(t)
+	ctx := context.Background()
+	w.e.Exec(`INSERT INTO custom_fields (workspace_id, entity, key, name, type) VALUES ($1, 'contact', 'seats', 'Seats', 'number')`, w.ws.ID)
+	nonFinite := []string{"NaN", "nan", "Inf", "+Inf", "-Inf", "Infinity", "+Infinity", "-Infinity"}
+
+	// The constructor refuses every non-finite spelling and names the field.
+	for _, v := range nonFinite {
+		_, err := ValidateConditions(ctx, w.e.D.DB.Pool, w.ws.ID, []RoutingCondition{{Field: "contact.field.seats", Op: "gt", Value: v}})
+		var he *httpx.Error
+		if !errors.As(err, &he) || he.Code != "validation_failed" || he.Status != 422 ||
+			!strings.Contains(he.Detail, "field.seats") || !strings.Contains(he.Detail, "finite") {
+			t.Fatalf("constructor %q: %v", v, err)
+		}
+	}
+
+	// The direct API answers 422 validation_failed and stores nothing.
+	var n int
+	w.e.Scalar(`SELECT count(*) FROM routing_rules WHERE workspace_id = $1`, &n, w.ws.ID)
+	if n != 0 {
+		t.Fatalf("start with %d rules", n)
+	}
+	for _, v := range nonFinite {
+		res := w.e.Do("POST", "/v1/routing-rules", w.admin(), map[string]any{"name": "bad " + v, "team_id": w.billing,
+			"conditions": []map[string]any{{"field": "contact.field.seats", "op": "gt", "value": v}}})
+		if res.Status != 422 || !strings.Contains(string(res.Body), "validation_failed") || !strings.Contains(string(res.Body), "field.seats") {
+			t.Fatalf("POST %q: %d %s", v, res.Status, res.Body)
+		}
+	}
+	w.e.Scalar(`SELECT count(*) FROM routing_rules WHERE workspace_id = $1`, &n, w.ws.ID)
+	if n != 0 {
+		t.Fatalf("%d invalid rules stored", n)
+	}
+
+	// Finite operands, including negatives, decimals, exponent and very large
+	// finite numbers, plus set/not_set, are kept as sent.
+	var r RoutingRule
+	w.e.Do("POST", "/v1/routing-rules", w.admin(), map[string]any{"name": "Seats", "team_id": w.billing,
+		"conditions": []map[string]any{
+			{"field": "contact.field.seats", "op": "gte", "value": "-1.5"},
+			{"field": "contact.field.seats", "op": "eq", "value": "1e3"},
+			{"field": "contact.field.seats", "op": "lt", "value": "1e308"},
+			{"field": "contact.field.seats", "op": "not_set", "value": ""},
+		}}).Want(t, 201).JSON(t, &r)
+	want := []struct{ op, value string }{
+		{"gte", "-1.5"}, {"eq", "1e3"}, {"lt", "1e308"}, {"not_set", ""},
+	}
+	if len(r.Conditions) != len(want) {
+		t.Fatalf("stored %+v", r.Conditions)
+	}
+	for i, c := range want {
+		if r.Conditions[i].Op != c.op || r.Conditions[i].Value != c.value {
+			t.Fatalf("condition %d = %+v, want %+v", i, r.Conditions[i], c)
+		}
+	}
+
+	// A bad operand on PATCH is refused and leaves the stored rule unchanged.
+	w.e.Do("PATCH", "/v1/routing-rules/"+r.ID.String(), w.admin(), map[string]any{
+		"conditions": []map[string]any{{"field": "contact.field.seats", "op": "gt", "value": "Infinity"}}}).Want(t, 422)
+	var kept RoutingRule
+	w.e.Do("GET", "/v1/routing-rules/"+r.ID.String(), w.admin(), nil).Want(t, 200).JSON(t, &kept)
+	if len(kept.Conditions) != 4 || kept.Conditions[1].Value != "1e3" {
+		t.Fatalf("rule changed after failed patch: %+v", kept.Conditions)
 	}
 }

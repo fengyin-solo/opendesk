@@ -510,8 +510,13 @@ func CheckFieldOperand(f CustomField, op, value string, allowMe bool) (string, e
 	bad := func(msg string) error { return httpx.Validation(fmt.Sprintf("field.%s: %s", f.Key, msg)) }
 	switch f.Type {
 	case FieldNumber:
-		if _, err := strconv.ParseFloat(value, 64); err != nil {
+		// Number operands are finite, the same invariant stored field values keep.
+		n, err := strconv.ParseFloat(value, 64)
+		if err != nil {
 			return "", bad("value must be a number")
+		}
+		if math.IsNaN(n) || math.IsInf(n, 0) {
+			return "", bad("value must be a finite number")
 		}
 	case FieldDate:
 		if _, err := time.Parse("2006-01-02", value); err != nil {
